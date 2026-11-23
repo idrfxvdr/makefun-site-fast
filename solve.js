@@ -235,6 +235,7 @@ function lex(src) {
 }
 
 const ESCAPABLE = new Set(['\\', '`', '*', '_', '[', ']', '(', ')', '#', '+', '-', '.', '!', '>']);
+const SPECIAL_OPEN = /[\\`*\[]/g;
 
 function findUnescaped(s, what, from) {
   for (let j = from; j <= s.length - what.length; j++) {
@@ -294,13 +295,10 @@ export function inline(s, env) {
       continue;
     }
     // Normal run: consume up to the next char that opens a special construct
-    // ( \ ` * [ ). Everything in between is escaped in one bulk call rather than per char.
-    let j = i + 1;
-    while (j < len) {
-      const d = s[j];
-      if (d === '\\' || d === '`' || d === '*' || d === '[') break;
-      j++;
-    }
+    // ( \ ` * [ ). A sticky regex finds it in native code; the run is escaped in one bulk call.
+    SPECIAL_OPEN.lastIndex = i;
+    const hit = SPECIAL_OPEN.exec(s);
+    const j = hit === null ? len : hit.index;
     out += escapeHtml(s.slice(i, j));
     i = j;
   }
