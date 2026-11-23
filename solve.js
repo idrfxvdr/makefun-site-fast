@@ -169,7 +169,7 @@ function headingOf(line) {
 }
 
 function endsParagraph(line) {
-  return BLANK_RE.test(line) || FENCE_OPEN_RE.test(line) || headingOf(line) !== null || HR_RE.test(line);
+  return isBlank(line) || FENCE_OPEN_RE.test(line) || headingOf(line) !== null || HR_RE.test(line);
 }
 
 // Trim spaces and tabs at both ends without a regex (called per line in lex).
@@ -181,42 +181,56 @@ function trimLine(line) {
   return a === 0 && b === line.length ? line : line.slice(a, b);
 }
 
+// A line that is empty or only spaces/tabs (BLANK_RE = /^[ \t]*$/), by a manual scan.
+function isBlank(line) {
+  for (let k = 0; k < line.length; k++) { const c = line.charCodeAt(k); if (c !== 0x20 && c !== 0x09) return false; }
+  return true;
+}
+
 function lex(src) {
   const lines = src.split('\n');
   const tokens = [];
+  const nLines = lines.length;
   let i = 0;
-  while (i < lines.length) {
+  while (i < nLines) {
     const line = lines[i];
-    if (BLANK_RE.test(line)) { i++; continue; }
-    const fence = FENCE_OPEN_RE.exec(line);
+    if (isBlank(line)) { i++; continue; }
+    // Fast dispatch on the first char: only a handful of starters can open a non-paragraph
+    // block ( ` # - * > or a digit). Anything else is a paragraph, skipping the regex cascade.
+    const c0 = line.charCodeAt(0);
+    let fence = null;
+    if (c0 === 96) fence = FENCE_OPEN_RE.exec(line); // `
     if (fence !== null) {
       const body = [];
       i++;
-      while (i < lines.length && !FENCE_CLOSE_RE.test(lines[i])) body.push(lines[i++]);
+      while (i < nLines && !FENCE_CLOSE_RE.test(lines[i])) body.push(lines[i++]);
       i++;
       tokens.push({ type: 'code', lang: fence[1], lines: body });
       continue;
     }
-    const heading = headingOf(line);
-    if (heading !== null) {
-      tokens.push({ type: 'heading', depth: heading.depth, text: heading.text });
-      i++;
-      continue;
-    }
-    if (HR_RE.test(line)) { tokens.push({ type: 'hr' }); i++; continue; }
-    if (QUOTE_RE.test(line)) {
+    if (c0 === 35) { // #
+      const heading = headingOf(line);
+      if (heading !== null) {
+        tokens.push({ type: 'heading', depth: heading.depth, text: heading.text });
+        i++;
+        continue;
+      }
+      // A #-line that is not a heading (7+ #, or no space) falls through to paragraph.
+    } else if (c0 === 45 || c0 === 42) { // - or * : a thematic break, else a bullet list item
+      if (HR_RE.test(line)) { tokens.push({ type: 'hr' }); i++; continue; }
+    } else if (c0 === 62) { // >
       const body = [];
-      while (i < lines.length && QUOTE_RE.test(lines[i])) body.push(lines[i++].replace(QUOTE_STRIP_RE, ''));
+      while (i < nLines && QUOTE_RE.test(lines[i])) body.push(lines[i++].replace(QUOTE_STRIP_RE, ''));
       tokens.push({ type: 'blockquote', lines: body.map(trimLine).filter((l) => l !== '') });
       continue;
     }
-    const bullet = BULLET_RE.exec(line);
-    const ordered = bullet === null ? ORDERED_RE.exec(line) : null;
+    const bullet = (c0 === 45 || c0 === 42) ? BULLET_RE.exec(line) : null;
+    const ordered = bullet === null && c0 >= 48 && c0 <= 57 ? ORDERED_RE.exec(line) : null;
     if (bullet !== null || ordered !== null) {
       const isOrdered = ordered !== null;
       const marker = isOrdered ? ORDERED_RE : BULLET_RE;
       const items = [];
-      while (i < lines.length) {
+      while (i < nLines) {
         const m = marker.exec(lines[i]);
         if (m !== null) { items.push([trimLine(isOrdered ? m[2] : m[1])]); i++; }
         else if (CONTINUED_RE.test(lines[i])) { items[items.length - 1].push(trimLine(lines[i])); i++; }
@@ -227,7 +241,7 @@ function lex(src) {
     }
     const body = [trimLine(line)];
     i++;
-    while (i < lines.length && !endsParagraph(lines[i])) body.push(trimLine(lines[i++]));
+    while (i < nLines && !endsParagraph(lines[i])) body.push(trimLine(lines[i++]));
     tokens.push({ type: 'paragraph', text: body.join('\n') });
   }
   return tokens;
@@ -294,8 +308,10 @@ export function inline(s, env) {
       continue;
     }
     // Normal run: consume up to the next char that opens a special construct
-    // ( \ ` * [ ). A sticky regex finds it in native code; the run is escaped in one bulk call.
-    SPECIAL_OPEN.lastIndex = i;
+    // ( \ ` * [ ). s[i] itself is always part of the run (it was not consumed as a
+    // construct opener above), so the search starts strictly after it; a sticky regex
+    // finds the boundary in native code and the run is escaped in one bulk call.
+    SPECIAL_OPEN.lastIndex = i + 1;
     const hit = SPECIAL_OPEN.exec(s);
     const j = hit === null ? len : hit.index;
     out += escapeHtml(s.slice(i, j));
