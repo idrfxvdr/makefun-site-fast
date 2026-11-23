@@ -453,35 +453,43 @@ function truthy(v) {
 }
 
 export function renderNodes(nodes, scope, ctx, depth) {
-  let out = '';
-  for (const n of nodes) {
+  const out = [];
+  renderInto(nodes, scope, ctx, depth, out);
+  return out.join('');
+}
+
+function renderInto(nodes, scope, ctx, depth, out) {
+  for (let i = 0; i < nodes.length; i++) {
+    const n = nodes[i];
     switch (n.kind) {
-      case 'text': out += n.text; break;
-      case 'var': out += ctx.escape(textOf(lookup(scope, n.path))); break;
-      case 'raw': out += textOf(lookup(scope, n.path)); break;
+      case 'text': out.push(n.text); break;
+      case 'var': out.push(ctx.escape(textOf(lookup(scope, n.path)))); break;
+      case 'raw': out.push(textOf(lookup(scope, n.path))); break;
       case 'if': {
         const v = truthy(lookup(scope, n.path));
         const branch = v !== n.not ? n.then : n.else;
-        if (branch !== null) out += renderNodes(branch, scope, ctx, depth);
+        if (branch !== null) renderInto(branch, scope, ctx, depth, out);
         break;
       }
       case 'for': {
         const xs = lookup(scope, n.path);
         if (!Array.isArray(xs)) break;
-        xs.forEach((x, k) => {
-          const vars = { [n.name]: x, loop: { index: k + 1, first: k === 0, last: k === xs.length - 1, length: xs.length } };
-          out += renderNodes(n.body, { vars, parent: scope }, ctx, depth);
-        });
+        const body = n.body;
+        const name = n.name;
+        const last = xs.length - 1;
+        for (let k = 0; k < xs.length; k++) {
+          const vars = { [name]: xs[k], loop: { index: k + 1, first: k === 0, last: k === last, length: xs.length } };
+          renderInto(body, { vars, parent: scope }, ctx, depth, out);
+        }
         break;
       }
       case 'include': {
         const t = ctx.templates.get(n.name);
-        if (t !== undefined && depth < INCLUDE_DEPTH) out += renderNodes(t, scope, ctx, depth + 1);
+        if (t !== undefined && depth < INCLUDE_DEPTH) renderInto(t, scope, ctx, depth + 1, out);
         break;
       }
     }
   }
-  return out;
 }
 
 // ------------------------------------------------------------------ the build
