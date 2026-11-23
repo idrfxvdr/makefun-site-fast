@@ -651,7 +651,7 @@ function cardOf(s) {
 
 function pageOf(s) {
   return {
-    ...cardOf(s),
+    ...s.card,
     slug: s.slug,
     content: s.html,
     toc: s.toc.map((h) => ({ level: h.level, id: h.id, html: h.html })),
@@ -662,10 +662,13 @@ function pageOf(s) {
 }
 
 function layouts(b) {
-  b.cards = new Map(b.posts.map((p) => [p, cardOf(p)]));
+  // Each source's card is a pure function of its (now fully computed) fields; build it once
+  // and reuse it for both the post cards map and the page layout (pageOf spreads it).
+  for (const s of b.sources) s.card = cardOf(s);
+  b.cards = new Map(b.posts.map((p) => [p, p.card]));
   const site = { title: b.input.site.title, base_url: b.base };
   const allTags = b.tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
-  const recent = b.posts.slice(0, b.input.site.recent).map((p) => b.cards.get(p));
+  const recent = b.posts.slice(0, b.input.site.recent).map((p) => p.card);
   const ctx = { templates: b.templates, escape: escapeHtml };
   const render = (name, vars) => {
     const nodes = b.templates.get(name);
