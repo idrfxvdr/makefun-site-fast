@@ -8,9 +8,10 @@
 
 const ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 const ESCAPE_RE = /[&<>"']/g;
+const HAS_SPECIAL_RE = /[&<>"']/;
 
 export function escapeHtml(text) {
-  return text.replace(ESCAPE_RE, (c) => ESCAPES[c]);
+  return HAS_SPECIAL_RE.test(text) ? text.replace(ESCAPE_RE, (c) => ESCAPES[c]) : text;
 }
 
 const SLUG_MAX = 64;
@@ -501,9 +502,21 @@ const CRLF_RE = /\r\n?/g;
 const SCHEME_RE = /^[A-Za-z][A-Za-z0-9+.-]*:/;
 const WORDS_RE = /\S+/g;
 
+// Whitespace as JS's \s (without u flag), which \S+ in wordsOf keys off.
+function isWsCode(c) {
+  if (c === 0x20 || (c >= 0x09 && c <= 0x0d)) return true;
+  if (c === 0xa0 || c === 0x1680 || (c >= 0x2000 && c <= 0x200a)) return true;
+  return c === 0x2028 || c === 0x2029 || c === 0x202f || c === 0x205f || c === 0x3000 || c === 0xfeff;
+}
+
 function wordsOf(text) {
-  const m = text.match(WORDS_RE);
-  return m === null ? 0 : m.length;
+  let count = 0;
+  let inWord = false;
+  for (let i = 0; i < text.length; i++) {
+    if (isWsCode(text.charCodeAt(i))) inWord = false;
+    else if (!inWord) { inWord = true; count++; }
+  }
+  return count;
 }
 
 function resolvePath(dir, rel) {
