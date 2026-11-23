@@ -497,10 +497,21 @@ function renderInto(nodes, scope, ctx, depth, out) {
         if (!Array.isArray(xs)) break;
         const body = n.body;
         const name = n.name;
-        const last = xs.length - 1;
-        for (let k = 0; k < xs.length; k++) {
-          const vars = { [name]: xs[k], loop: { index: k + 1, first: k === 0, last: k === last, length: xs.length } };
-          renderInto(body, { vars, parent: scope }, ctx, depth, out);
+        const len = xs.length;
+        const last = len - 1;
+        // One scope + loop object reused across iterations (each iteration fully renders before
+        // the next mutates it), so a long list does not allocate a fresh pair per element.
+        const vars = {};
+        const loop = { index: 0, first: false, last: false, length: len };
+        vars[name] = undefined;
+        vars.loop = loop;
+        const scope2 = { vars, parent: scope };
+        for (let k = 0; k < len; k++) {
+          vars[name] = xs[k];
+          loop.index = k + 1;
+          loop.first = k === 0;
+          loop.last = k === last;
+          renderInto(body, scope2, ctx, depth, out);
         }
         break;
       }
