@@ -173,7 +173,14 @@ function endsParagraph(line) {
   return BLANK_RE.test(line) || FENCE_OPEN_RE.test(line) || headingOf(line) !== null || HR_RE.test(line);
 }
 
-const trimLine = (line) => line.replace(TRIM_LINE_RE, '');
+// Trim spaces and tabs at both ends without a regex (called per line in lex).
+function trimLine(line) {
+  let a = 0;
+  let b = line.length;
+  while (a < b) { const c = line.charCodeAt(a); if (c === 0x20 || c === 0x09) a++; else break; }
+  while (b > a) { const c = line.charCodeAt(b - 1); if (c === 0x20 || c === 0x09) b--; else break; }
+  return a === 0 && b === line.length ? line : line.slice(a, b);
+}
 
 function lex(src) {
   const lines = src.split('\n');
