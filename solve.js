@@ -330,36 +330,36 @@ export function renderMarkdown(src, env) {
       case 'heading': {
         const id = uniqueSlug(slugify(t.text), ids);
         const html = inline(t.text, env);
-        blocks.push(`<h${t.depth} id="${id}">${html}</h${t.depth}>`);
+        blocks.push(`<h${t.depth} id="${id}">${html}</h${t.depth}>\n`);
         if (t.depth === 2 || t.depth === 3) toc.push({ level: t.depth, id, html });
         break;
       }
       case 'code': {
         const cls = t.lang === '' ? '' : ` class="language-${escapeHtml(t.lang)}"`;
-        blocks.push(`<pre><code${cls}>${t.lines.map((l) => `${escapeHtml(l)}\n`).join('')}</code></pre>`);
+        blocks.push(`<pre><code${cls}>${t.lines.map((l) => `${escapeHtml(l)}\n`).join('')}</code></pre>\n`);
         break;
       }
       case 'hr':
-        blocks.push('<hr>');
+        blocks.push('<hr>\n');
         break;
       case 'blockquote':
-        blocks.push(t.lines.length === 0 ? '<blockquote>\n</blockquote>' : `<blockquote>\n<p>${inline(t.lines.join('\n'), env)}</p>\n</blockquote>`);
+        blocks.push(t.lines.length === 0 ? '<blockquote>\n</blockquote>\n' : `<blockquote>\n<p>${inline(t.lines.join('\n'), env)}</p>\n</blockquote>\n`);
         break;
       case 'list': {
         const tag = t.ordered ? 'ol' : 'ul';
         const open = t.ordered && t.start !== 1 ? `<ol start="${t.start}">` : `<${tag}>`;
-        blocks.push(`${open}\n${t.items.map((item) => `<li>${inline(item, env)}</li>\n`).join('')}</${tag}>`);
+        blocks.push(`${open}\n${t.items.map((item) => `<li>${inline(item, env)}</li>\n`).join('')}</${tag}>\n`);
         break;
       }
       case 'paragraph': {
         const html = inline(t.text, env);
         if (excerpt === null) excerpt = html;
-        blocks.push(`<p>${html}</p>`);
+        blocks.push(`<p>${html}</p>\n`);
         break;
       }
     }
   }
-  return { html: blocks.map((b) => `${b}\n`).join(''), toc, excerpt: excerpt ?? '' };
+  return { html: blocks.join(''), toc, excerpt: excerpt ?? '' };
 }
 
 // ------------------------------------------------------------------ templates
