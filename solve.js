@@ -160,7 +160,6 @@ const QUOTE_RE = /^>/;
 const BULLET_RE = /^[-*] (.*)$/;
 const ORDERED_RE = /^(\d{1,9})\. (.*)$/;
 const CONTINUED_RE = /^ {2,}\S/;
-const TRIM_LINE_RE = /^[ \t]+|[ \t]+$/g;
 const QUOTE_STRIP_RE = /^> ?/;
 const WS_RE = /\s/;
 
@@ -505,7 +504,6 @@ const RESERVED = ['posts', 'tags', 'page'];
 const byCodeUnits = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 const CRLF_RE = /\r\n?/g;
 const SCHEME_RE = /^[A-Za-z][A-Za-z0-9+.-]*:/;
-const WORDS_RE = /\S+/g;
 
 // Whitespace as JS's \s (without u flag), which \S+ in wordsOf keys off.
 function isWsCode(c) {
