@@ -250,9 +250,10 @@ function findSingleStar(s, from) {
 export function inline(s, env) {
   let out = '';
   let i = 0;
-  while (i < s.length) {
+  const len = s.length;
+  while (i < len) {
     const c = s[i];
-    if (c === '\\' && i + 1 < s.length && ESCAPABLE.has(s[i + 1])) { out += escapeHtml(s[i + 1]); i += 2; continue; }
+    if (c === '\\' && i + 1 < len && ESCAPABLE.has(s[i + 1])) { out += escapeHtml(s[i + 1]); i += 2; continue; }
     if (c === '`') {
       const j = s.indexOf('`', i + 1);
       if (j > i + 1) { out += `<code>${escapeHtml(s.slice(i + 1, j))}</code>`; i = j + 1; }
@@ -284,8 +285,16 @@ export function inline(s, env) {
       i++;
       continue;
     }
-    out += escapeHtml(c);
-    i++;
+    // Normal run: consume up to the next char that opens a special construct
+    // ( \ ` * [ ). Everything in between is escaped in one bulk call rather than per char.
+    let j = i + 1;
+    while (j < len) {
+      const d = s[j];
+      if (d === '\\' || d === '`' || d === '*' || d === '[') break;
+      j++;
+    }
+    out += escapeHtml(s.slice(i, j));
+    i = j;
   }
   return out;
 }
