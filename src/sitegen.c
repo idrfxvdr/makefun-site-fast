@@ -1126,7 +1126,7 @@ static Val* vobj_new(u32 cap){
   u32* buf=(u32*)bump((cap+1)*sizeof(u32)); buf[0]=cap;
   v->as.obj.m=(VMemb*)(buf+1); v->as.obj.len=0; return v;
 }
-static void vobj_set(Val* o, Str key, Val* x){
+static void vobj_set_checked(Val* o, Str key, Val* x){
   u32* buf=(u32*)o->as.obj.m - 1; u32 cap=*buf;
   // replace existing key or append
   for (u32 i=0;i<o->as.obj.len;i++) if (str_eq(o->as.obj.m[i].key,key)){ o->as.obj.m[i].val=x; return; }
@@ -1395,15 +1395,15 @@ static void render_into(NodeArr* nodes, Scope* scope, RenderCtx* ctx, int depth,
         // reuse one loop object + one vars object across iterations (like JS), mutate fields instead of new each time
         Val* loop=vobj_new(4);
         Val* vars=vobj_new(4);
-        vobj_set(vars, n->name, vnull());
-        vobj_set(vars, str_from_c("loop"), loop);
+        vobj_set_checked(vars, n->name, vnull());
+        vobj_set_checked(vars, str_from_c("loop"), loop);
         Scope sc2; sc2.vars=vars; sc2.parent=scope;
         for (u32 k=0;k<len;k++){
-          vobj_set(vars, n->name, xs->as.arr.it[k]);
-          vobj_set(loop, str_from_c("index"), vnum(k+1));
-          vobj_set(loop, str_from_c("first"), vbool(k==0));
-          vobj_set(loop, str_from_c("last"), vbool(k==len-1));
-          vobj_set(loop, str_from_c("length"), vnum(len));
+          vobj_set_checked(vars, n->name, xs->as.arr.it[k]);
+          vobj_set_checked(loop, str_from_c("index"), vnum(k+1));
+          vobj_set_checked(loop, str_from_c("first"), vbool(k==0));
+          vobj_set_checked(loop, str_from_c("last"), vbool(k==len-1));
+          vobj_set_checked(loop, str_from_c("length"), vnum(len));
           render_into(&n->body, &sc2, ctx, depth, out);
         }
         break;
@@ -1426,7 +1426,7 @@ static Val* jval_to_val(JVal* j){
     case JNUM: return vnum(j->as.num);
     case JSTR: return vstr((Str){j->as.s.p, j->as.s.len});
     case JARR: { Val* a=varr_new(8); for(u32 i=0;i<j->as.arr.len;i++) varr_push(a, jval_to_val(j->as.arr.items[i])); return a; }
-    case JOBJ: { Val* o=vobj_new(8); for(u32 i=0;i<j->as.obj.len;i++){ Str k={j->as.obj.m[i].key, j->as.obj.m[i].keylen}; vobj_set(o, k, jval_to_val(j->as.obj.m[i].val)); } return o; }
+    case JOBJ: { Val* o=vobj_new(8); for(u32 i=0;i<j->as.obj.len;i++){ Str k={j->as.obj.m[i].key, j->as.obj.m[i].keylen}; vobj_set_checked(o, k, jval_to_val(j->as.obj.m[i].val)); } return o; }
   }
   return vnull();
 }
