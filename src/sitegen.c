@@ -1123,7 +1123,7 @@ static void varr_push(Val* a, Val* x){
 
 static Val* vobj_new(u32 cap){
   Val* v=vnew(VOBJ);
-  u32* buf=(u32*)bump((cap+1)*sizeof(u32)); buf[0]=cap;
+  u32* buf=(u32*)bump(sizeof(u32) + cap*sizeof(VMemb)); buf[0]=cap;
   v->as.obj.m=(VMemb*)(buf+1); v->as.obj.len=0; return v;
 }
 static void vobj_set_checked(Val* o, Str key, Val* x){
@@ -1131,7 +1131,7 @@ static void vobj_set_checked(Val* o, Str key, Val* x){
   // replace existing key or append
   for (u32 i=0;i<o->as.obj.len;i++) if (str_eq(o->as.obj.m[i].key,key)){ o->as.obj.m[i].val=x; return; }
   if (o->as.obj.len==cap){
-    u32 nc=cap?cap*2:8; u32* nb=(u32*)bump((nc+1)*sizeof(u32)); nb[0]=nc; VMemb* dst=(VMemb*)(nb+1);
+    u32 nc=cap?cap*2:8; u32* nb=(u32*)bump(sizeof(u32) + nc*sizeof(VMemb)); nb[0]=nc; VMemb* dst=(VMemb*)(nb+1);
     if(o->as.obj.len) memcpy(dst,o->as.obj.m,o->as.obj.len*sizeof(VMemb)); o->as.obj.m=dst; cap=nc;
   }
   o->as.obj.m[o->as.obj.len].key=key; o->as.obj.m[o->as.obj.len].val=x; o->as.obj.len++;
