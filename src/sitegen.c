@@ -1504,3 +1504,170 @@ u32 mg_test_jsonstr(u32 inPtr, u32 inLen){
   if (CTRL[CTRL_STATUS]!=1) CTRL[CTRL_STATUS]=0;
   return b.len;
 }
+// ================================================================== THE BUILD (index.js)
+// Mirrors makefun-site 1.0.0's build() pipeline over our Val/Str model.
+
+typedef struct Source Source;
+typedef struct Tag Tag;
+
+struct Source {
+  Str path;          // owned (file path)
+  Str text;          // owned content (CRLF->LF for .md)
+  int post;          // path starts with "posts/"
+  FMData data;       // front matter
+  Str body;          // body slice (into text) after front matter
+  Str layout;        // resolved layout name
+  Str slug;          // unique slug
+  Str outDir;        // dir/slug or slug
+  Str url;           // base/outDir/
+  Str html;          // rendered html
+  TocArr toc;        // toc
+  Str excerpt;       // excerpt
+  Val* card;         // built card (Val) in layouts
+  Source* newer;
+  Source* older;
+  Tag** tagRefs; u32 ntagRefs;  // tag refs
+};
+
+struct Tag {
+  Str name, slug, url;
+  Source** posts; u32 nposts; u32 capposts;
+};
+
+static void tag_add_post(Tag* t, Source* s){
+  if (t->nposts==t->capposts){ u32 nc=t->capposts?t->capposts*2:4; Source** np=(Source**)bump(nc*sizeof(Source*)); if(t->posts&&t->nposts)memcpy(np,t->posts,t->nposts*sizeof(Source*)); t->posts=np; t->capposts=nc; }
+  t->posts[t->nposts++]=s;
+}
+
+// ---- code-unit / byte compare for Str (paths/slugs/dates are ASCII in practice) ----
+static int str_cmp(Str a, Str b){
+  u32 n = a.len<b.len? a.len : b.len;
+  int c = n? memcmp(a.p,b.p,n) : 0;
+  if (c) return c;
+  if (a.len<b.len) return -1;
+  if (a.len>b.len) return 1;
+  return 0;
+}
+
+// ---- wordsOf: count runs of non-\s (JS \S+ matches) over UTF-8 ----
+static u32 words_of(Str s){
+  u32 count=0; int inWord=0; u32 i=0;
+  while (i<s.len){ u32 j=i; u32 cp=utf8_next(s.p,s.len,&j); int ws=is_ws_cp(cp); if (ws) inWord=0; else if (!inWord){ inWord=1; count++; } i=j; }
+  return count;
+}
+
+// ---- CRLF normalize: \r\n? -> \n ----
+static Str crlf_normalize(Str in){
+  Buf b; b.p=NULL;b.len=0;b.cap=0;
+  for (u32 i=0;i<in.len;i++){ u8 c=in.p[i]; if (c=='\r'){ if (i+1<in.len && in.p[i+1]=='\n') continue; /* lone \r -> \n */ buf_putc(&b,'\n'); } else buf_putc(&b,c); }
+  Str r={b.p,b.len}; return r;
+}
+
+// ---- path helpers ----
+static Str dir_of(Str path){ i64 k=-1; for(u32 i=0;i<path.len;i++) if(path.p[i]=='/')k=(i64)i; if(k<0) return str_from_c(""); Str r={path.p,(u32)k}; return r; }
+static int path_starts(Str path, Str prefix){ return path.len>=prefix.len && memcmp(path.p,prefix.p,prefix.len)==0; }
+static int path_ends_with(Str path, const char* suf){ u32 sl=0; while(suf[sl])sl++; if(path.len<sl)return 0; return memcmp(path.p+path.len-sl,suf,sl)==0; }
+
+// resolvePath(dir, rel) -> 1 & out (Buf) on success, 0 if climbs out. Appends joined path to out.
+static int resolve_path(Buf* out, Str dir, Str rel){
+  Str parts[64]; u32 np=0;
+  if (dir.len){ u32 s=0; for(u32 i=0;i<=dir.len;i++){ if(i==dir.len||dir.p[i]=='/'){ if(i>s){ parts[np].p=dir.p+s; parts[np].len=i-s; np++; } s=i+1; } } }
+  u32 s=0;
+  for (u32 i=0;i<=rel.len;i++){
+    if (i==rel.len || rel.p[i]=='/'){
+      Str seg={rel.p+s, i-s};
+      if (seg.len==0 || (seg.len==1&&seg.p[0]=='.')){ /* skip */ }
+      else if (seg.len==2 && seg.p[0]=='.'&&seg.p[1]=='.'){ if(np==0){ return 0; } np--; }
+      else { parts[np]=seg; np++; }
+      s=i+1;
+    }
+  }
+  for (u32 k=0;k<np;k++){ if(k) buf_putc(out,'/'); buf_write(out,parts[k].p,parts[k].len); }
+  return 1;
+}
+
+// ---- broken-link set ----
+typedef struct { Str* v; u32 len; u32 cap; } StrVec;
+static void strvec_push(StrVec* a, Str x){
+  if(a->len==a->cap){u32 nc=a->cap?a->cap*2:8;Str*na=(Str*)bump(nc*sizeof(Str));if(a->v&&a->len)memcpy(na,a->v,a->len*sizeof(Str));a->v=na;a->cap=nc;}
+  a->v[a->len++]=x;
+}
+static int strvec_has(StrVec* a, Str x){ for(u32 i=0;i<a->len;i++) if(str_eq(a->v[i],x)) return 1; return 0; }
+
+// ---- build context for link resolution ----
+typedef struct {
+  Source* sources; u32 nsources;
+  Str* staticPaths; u32 nstatics;
+  Str base;
+  StrVec broken;
+  Str curDir;
+} BuildCtx;
+
+// scheme? ^[A-Za-z][A-Za-z0-9+.-]*:
+static int scheme_re(Str t){
+  if (t.len==0) return 0; u8 c=t.p[0]; if(!((c>='A'&&c<='Z')||(c>='a'&&c<='z'))) return 0;
+  u32 i=1; while(i<t.len){ u8 d=t.p[i]; if(d==':') return 1; if((d>='A'&&d<='Z')||(d>='a'&&d<='z')||(d>='0'&&d<='9')||d=='+'||d=='.'||d=='-') i++; else return 0; }
+  return 0;
+}
+
+static Source* bysource_get(BuildCtx* c, Str path){ for(u32 i=0;i<c->nsources;i++) if(str_eq(c->sources[i].path,path)) return &c->sources[i]; return NULL; }
+static int staticpaths_has(BuildCtx* c, Str path){ for(u32 i=0;i<c->nstatics;i++) if(str_eq(c->staticPaths[i],path)) return 1; return 0; }
+
+static Str build_link(void* vctx, const u8* t, u32 tlen){
+  BuildCtx* c=(BuildCtx*)vctx;
+  Str target={ (u8*)t, tlen };
+  if (scheme_re(target) || (tlen>0 && t[0]=='/') || (tlen>0 && t[0]=='#')) return target;
+  i64 hash=-1; for(u32 i=0;i<tlen;i++) if(t[i]=='#'){hash=(i64)i;break;}
+  Str rel, frag;
+  if (hash==-1){ rel=target; frag=str_from_c(""); }
+  else { rel.p=t; rel.len=(u32)hash; frag.p=t+(u32)hash; frag.len=tlen-(u32)hash; }
+  Buf pb; pb.p=NULL;pb.len=0;pb.cap=0;
+  int rok = 1;
+  if (rel.len!=0) rok = resolve_path(&pb, c->curDir, rel);
+  if (rok){
+    Str path={pb.p,pb.len};
+    Source* s=bysource_get(c,path);
+    if (s){ Buf u; u.p=NULL;u.len=0;u.cap=0; buf_write(&u,s->url.p,s->url.len); buf_write(&u,frag.p,frag.len); Str r={u.p,u.len}; return r; }
+    if (staticpaths_has(c,path)){ Buf u;u.p=NULL;u.len=0;u.cap=0; buf_puts(&u,"/"); /* placeholder */ u.len=0; buf_write(&u,c->base.p,c->base.len); buf_putc(&u,'/'); buf_write(&u,path.p,path.len); buf_write(&u,frag.p,frag.len); Str r={u.p,u.len}; return r; }
+  }
+  // broken
+  { Buf bl; bl.p=NULL;bl.len=0;bl.cap=0; buf_puts(&bl,"broken-link "); buf_write(&bl,c->sources[0].path.p,0); /* source path added by caller */ }
+  // We need the current source path; stored separately. Build line: "broken-link CURPATH -> TARGET"
+  Buf bl; bl.p=NULL;bl.len=0;bl.cap=0;
+  // curSourcePath stashed in curDir? No. Use a dedicated field.
+  extern Str g_cur_source_path;
+  buf_puts(&bl,"broken-link "); buf_write(&bl,g_cur_source_path.p,g_cur_source_path.len); buf_puts(&bl," -> "); buf_write(&bl,target.p,target.len);
+  Str line={bl.p,bl.len};
+  if (!strvec_has(&c->broken,line)) strvec_push(&c->broken,line);
+  return target;
+}
+Str g_cur_source_path;
+
+// ---- insertion sort Sources by path (code-unit order) ----
+static void sort_sources_by_path(Source* a, u32 n){
+  for (u32 i=1;i<n;i++){ Source k=a[i]; u32 j=i; while(j>0 && str_cmp(a[j-1].path,k.path)>0){ a[j]=a[j-1]; j--; } a[j]=k; }
+}
+// sort Sources by (date desc, slug asc)
+static void sort_posts(Source** a, u32 n){
+  for (u32 i=1;i<n;i++){ Source* k=a[i]; u32 j=i; while(j>0){
+    Source* x=a[j-1];
+    int c = str_cmp(x->data.date, k->data.date); // date desc => if x.date < k.date, x after
+    if (c<0){ a[j]=a[j-1]; j--; continue; }
+    if (c==0){ int c2=str_cmp(x->slug,k->slug); if(c2>0){ a[j]=a[j-1]; j--; continue; } }
+    break;
+  } a[j]=k; } }
+// sort Tags by (posts desc, slug asc)
+static void sort_tags(Tag** a, u32 n){
+  for (u32 i=1;i<n;i++){ Tag* k=a[i]; u32 j=i; while(j>0){
+    Tag* x=a[j-1];
+    if (x->nposts < k->nposts){ a[j]=a[j-1]; j--; continue; }
+    if (x->nposts==k->nposts){ int c=str_cmp(x->slug,k->slug); if(c>0){ a[j]=a[j-1]; j--; continue; } }
+    break;
+  } a[j]=k; } }
+// sort StrVec (report lines)
+static void sort_strvec(StrVec* a){
+  Str* p=a->v; u32 n=a->len;
+  for (u32 i=1;i<n;i++){ Str k=p[i]; u32 j=i; while(j>0 && str_cmp(p[j-1],k)>0){ p[j]=p[j-1]; j--; } p[j]=k; }
+}
+
+static u32 g_cur_dummy;
