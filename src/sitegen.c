@@ -941,7 +941,7 @@ static TokArr lex_markdown(const u8* src, u32 len){
           if(cnt==icap){icap*=2;Str*ni=(Str*)bump(icap*sizeof(Str));memcpy(ni,items,cnt*sizeof(Str));items=ni;}
           items[cnt].p=ib.p; items[cnt].len=ib.len; cnt++;
           i++;
-          while (i<n && match_continued(L.v[i])){ Str tl2=trim_line(L.v[i]); buf_putc(&ib,'\n'); buf_write(&ib,tl2.p,tl2.len); items[cnt-1].len=ib.len; i++; }
+          while (i<n && match_continued(L.v[i])){ Str tl2=trim_line(L.v[i]); buf_putc(&ib,'\n'); buf_write(&ib,tl2.p,tl2.len); items[cnt-1].p=ib.p; items[cnt-1].len=ib.len; i++; }
         }
         t.items=items; t.nit=cnt; toks_push(&toks,t); continue;
       }
@@ -1595,6 +1595,9 @@ static void strvec_push(StrVec* a, Str x){
 static int strvec_has(StrVec* a, Str x){ for(u32 i=0;i<a->len;i++) if(str_eq(a->v[i],x)) return 1; return 0; }
 
 // ---- build context for link resolution ----
+static Str g_cur_source_path;  // current source's path, for broken-link lines
+static Str identity_link(void* ctx, const u8* t, u32 tlen);
+
 typedef struct {
   Source* sources; u32 nsources;
   Str* staticPaths; u32 nstatics;
@@ -1628,20 +1631,16 @@ static Str build_link(void* vctx, const u8* t, u32 tlen){
     Str path={pb.p,pb.len};
     Source* s=bysource_get(c,path);
     if (s){ Buf u; u.p=NULL;u.len=0;u.cap=0; buf_write(&u,s->url.p,s->url.len); buf_write(&u,frag.p,frag.len); Str r={u.p,u.len}; return r; }
-    if (staticpaths_has(c,path)){ Buf u;u.p=NULL;u.len=0;u.cap=0; buf_puts(&u,"/"); /* placeholder */ u.len=0; buf_write(&u,c->base.p,c->base.len); buf_putc(&u,'/'); buf_write(&u,path.p,path.len); buf_write(&u,frag.p,frag.len); Str r={u.p,u.len}; return r; }
+    if (staticpaths_has(c,path)){ Buf u;u.p=NULL;u.len=0;u.cap=0; buf_write(&u,c->base.p,c->base.len); buf_putc(&u,'/'); buf_write(&u,path.p,path.len); buf_write(&u,frag.p,frag.len); Str r={u.p,u.len}; return r; }
   }
-  // broken
-  { Buf bl; bl.p=NULL;bl.len=0;bl.cap=0; buf_puts(&bl,"broken-link "); buf_write(&bl,c->sources[0].path.p,0); /* source path added by caller */ }
-  // We need the current source path; stored separately. Build line: "broken-link CURPATH -> TARGET"
+  // broken: "broken-link CURPATH -> TARGET"
+  Str curpath = g_cur_source_path;
   Buf bl; bl.p=NULL;bl.len=0;bl.cap=0;
-  // curSourcePath stashed in curDir? No. Use a dedicated field.
-  extern Str g_cur_source_path;
-  buf_puts(&bl,"broken-link "); buf_write(&bl,g_cur_source_path.p,g_cur_source_path.len); buf_puts(&bl," -> "); buf_write(&bl,target.p,target.len);
+  buf_puts(&bl,"broken-link "); buf_write(&bl,curpath.p,curpath.len); buf_puts(&bl," -> "); buf_write(&bl,target.p,target.len);
   Str line={bl.p,bl.len};
   if (!strvec_has(&c->broken,line)) strvec_push(&c->broken,line);
   return target;
 }
-Str g_cur_source_path;
 
 // ---- insertion sort Sources by path (code-unit order) ----
 static void sort_sources_by_path(Source* a, u32 n){
@@ -1671,3 +1670,561 @@ static void sort_strvec(StrVec* a){
 }
 
 static u32 g_cur_dummy;
+
+// ================================================================== build state + pipeline
+#define REPORT_FILE "build-report.txt"
+static const char* const RESERVED[3]={"posts","tags","page"};
+
+typedef struct {
+  Str base;          // base_url with trailing / removed
+  TplTable tpls;     // parsed templates (only those that parsed)
+  Source* sources; u32 nsources, capsrc;
+  // statics
+  Str* staticsPath; Str* staticsContent; u32 nstatics, capstatic;
+  // permalinks taken-map: per-dir sets. Simple: array of (dir, StrVec).
+  Str* takenDir; StrVec* takenSet; u32 ntaken, captaken;
+  StrVec report;     // report lines (refusals/drafts)
+  Source** posts; u32 nposts;
+  Tag** tags; u32 ntags, captags;
+  BuildCtx bc;
+} Build;
+
+static StrVec* taken_in(Build* b, Str dir){
+  for (u32 i=0;i<b->ntaken;i++) if (str_eq(b->takenDir[i],dir)) return &b->takenSet[i];
+  if (b->ntaken==b->captaken){ u32 nc=b->captaken?b->captaken*2:4; Str* nd=(Str*)bump(nc*sizeof(Str)); StrVec* ns=(StrVec*)bump(nc*sizeof(StrVec)); if(b->takenDir&&b->ntaken){memcpy(nd,b->takenDir,b->ntaken*sizeof(Str));memcpy(ns,b->takenSet,b->ntaken*sizeof(StrVec));} b->takenDir=nd;b->takenSet=ns;b->captaken=nc; }
+  b->takenDir[b->ntaken]=dir; b->takenSet[b->ntaken].v=NULL;b->takenSet[b->ntaken].len=0;b->takenSet[b->ntaken].cap=0;
+  StrVec* s=&b->takenSet[b->ntaken];
+  if (dir.len==0){ for(int k=0;k<3;k++) strvec_push(s, str_from_c(RESERVED[k])); }
+  b->ntaken++;
+  return s;
+}
+
+static void build_add_static(Build* b, Str path, Str content){
+  if (b->nstatics==b->capstatic){ u32 nc=b->capstatic?b->capstatic*2:8; Str* np=(Str*)bump(nc*sizeof(Str)); Str* nc2=(Str*)bump(nc*sizeof(Str)); if(b->staticsPath&&b->nstatics){memcpy(np,b->staticsPath,b->nstatics*sizeof(Str));memcpy(nc2,b->staticsContent,b->nstatics*sizeof(Str));} b->staticsPath=np;b->staticsContent=nc2;b->capstatic=nc; }
+  b->staticsPath[b->nstatics]=path; b->staticsContent[b->nstatics]=content; b->nstatics++;
+}
+
+static Source* build_add_source(Build* b){
+  if (b->nsources==b->capsrc){ u32 nc=b->capsrc?b->capsrc*2:16; Source* ns=(Source*)bump(nc*sizeof(Source)); if(b->sources&&b->nsources)memcpy(ns,b->sources,b->nsources*sizeof(Source)); b->sources=ns; b->capsrc=nc; }
+  Source* s=&b->sources[b->nsources++]; memset(s,0,sizeof(Source)); return s;
+}
+
+// uniqueSlug against a taken-set -> owned Str
+static Str unique_slug_set(Str slug, StrVec* taken){
+  Buf b; b.p=NULL;b.len=0;b.cap=0; buf_write(&b,slug.p,slug.len);
+  u32 n=2;
+  while (strvec_has(taken,(Str){b.p,b.len})){ b.len=0; buf_write(&b,slug.p,slug.len); buf_putc(&b,'-'); buf_put_u32(&b,n); n++; }
+  Str r={b.p,b.len}; strvec_push(taken,r); return r;
+}
+
+// 1. readSources: sort files by path; .md -> sources (CRLF->LF), else static.
+static void read_sources(Build* b, JVal* files){
+  // collect (path, JVal*) pairs
+  u32 n = files->as.arr.len;
+  // insertion sort by path
+  // Build an index array sorted by path
+  u32* idx=(u32*)bump(n*sizeof(u32)); for(u32 i=0;i<n;i++) idx[i]=i;
+  for (u32 i=1;i<n;i++){ u32 k=idx[i]; u32 j=i; 
+    Str kp={files->as.arr.items[k]->as.obj.m[0].key, files->as.arr.items[k]->as.obj.m[0].keylen};
+    // find "path" member properly
+    JVal* ko = files->as.arr.items[k]; JVal* pv=jobj_get(ko,"path"); Str kpath={pv->as.s.p,pv->as.s.len};
+    while(j>0){ JVal* oj=files->as.arr.items[idx[j-1]]; JVal* pj=jobj_get(oj,"path"); Str jpath={pj->as.s.p,pj->as.s.len}; if(str_cmp(jpath,kpath)>0){ idx[j]=idx[j-1]; j--; } else break; }
+    idx[j]=k; }
+  for (u32 ii=0;ii<n;ii++){
+    JVal* f=files->as.arr.items[idx[ii]];
+    JVal* pv=jobj_get(f,"path"); Str path={pv->as.s.p,pv->as.s.len};
+    JVal* cv=jobj_get(f,"content"); Str content={cv->as.s.p,cv->as.s.len};
+    if (path_ends_with(path,".md")){
+      Source* s=build_add_source(b); s->path.p=(u8*)bump(path.len); memcpy(s->path.p,path.p,path.len); s->path.len=path.len;
+      Str norm=crlf_normalize(content); s->text=norm;
+    } else {
+      Str pc; pc.p=(u8*)bump(path.len); memcpy(pc.p,path.p,path.len); pc.len=path.len; path=pc;
+      Str cc; cc.p=(u8*)bump(content.len); memcpy(cc.p,content.p,content.len); cc.len=content.len; content=cc;
+      build_add_static(b,path,content);
+    }
+  }
+}
+
+// 2. frontMatter
+static void front_matter(Build* b){
+  u32 w=0;
+  for (u32 i=0;i<b->nsources;i++){
+    Source* s=&b->sources[i];
+    FMResult fm=parse_front_matter(s->text.p, s->text.len);
+    if (fm.error){
+      Buf bl;bl.p=NULL;bl.len=0;bl.cap=0; buf_puts(&bl,"refused "); buf_write(&bl,s->path.p,s->path.len); buf_puts(&bl,": "); buf_write(&bl,fm.errmsg.p,fm.errmsg.len);
+      strvec_push(&b->report,(Str){bl.p,bl.len});
+      continue;
+    }
+    s->data=fm.data;
+    s->body.p=(u8*)fm.body; s->body.len=fm.bodylen;
+    s->post = path_starts(s->path, str_from_c("posts/"));
+    // reserved own dir?
+    int own=-1;
+    for (int k=0;k<3;k++){ if (k==0) continue; /* posts allowed */ Str pre; char tmp[8]; int pl=0; const char* rd=RESERVED[k]; while(rd[pl]){tmp[pl]=rd[pl];pl++;} tmp[pl]='/'; pl++; pre.p=(u8*)tmp; pre.len=pl; if (path_starts(s->path,pre)){ own=k; break; } }
+    if (own!=0 && own!=-1){
+      Buf bl;bl.p=NULL;bl.len=0;bl.cap=0; buf_puts(&bl,"refused "); buf_write(&bl,s->path.p,s->path.len); buf_puts(&bl,": "); const char* rd=RESERVED[own]; int pl=0; while(rd[pl]){buf_putc(&bl,(u8)rd[pl]);pl++;} buf_puts(&bl,"/ is the generator's own");
+      strvec_push(&b->report,(Str){bl.p,bl.len}); continue;
+    }
+    if (s->post && !s->data.has_date){
+      Buf bl;bl.p=NULL;bl.len=0;bl.cap=0; buf_puts(&bl,"refused "); buf_write(&bl,s->path.p,s->path.len); buf_puts(&bl,": a post needs a date");
+      strvec_push(&b->report,(Str){bl.p,bl.len}); continue;
+    }
+    Str layout = s->data.has_layout? s->data.layout : str_from_c(s->post?"post":"page");
+    // template exists?
+    if (!tpl_get(&b->tpls, layout)){ 
+      Buf bl;bl.p=NULL;bl.len=0;bl.cap=0; buf_puts(&bl,"refused "); buf_write(&bl,s->path.p,s->path.len); buf_puts(&bl,": layout \""); buf_write(&bl,layout.p,layout.len); buf_puts(&bl,"\" is no template that parses");
+      strvec_push(&b->report,(Str){bl.p,bl.len}); continue;
+    }
+    s->layout=layout;
+    if (s->data.has_draft && s->data.draft){
+      Buf bl;bl.p=NULL;bl.len=0;bl.cap=0; buf_puts(&bl,"draft "); buf_write(&bl,s->path.p,s->path.len);
+      strvec_push(&b->report,(Str){bl.p,bl.len}); continue;
+    }
+    // keep: move to w
+    if (w!=i) b->sources[w]=b->sources[i];
+    w++;
+  }
+  b->nsources=w;
+}
+
+// 3. permalinks
+static void permalinks(Build* b){
+  for (u32 i=0;i<b->nsources;i++){
+    Source* s=&b->sources[i];
+    Str dir = s->post? str_from_c("posts") : dir_of(s->path);
+    Str slugsrc = s->data.has_slug? s->data.slug : ({ Buf t;t.p=NULL;t.len=0;t.cap=0; slugify_into(&t,s->data.title.p,s->data.title.len); Str r={t.p,t.len}; r; });
+    StrVec* taken=taken_in(b,dir);
+    s->slug=unique_slug_set(slugsrc,taken);
+    if (dir.len==0) s->outDir=s->slug; else { Buf o;o.p=NULL;o.len=0;o.cap=0; buf_write(&o,dir.p,dir.len); buf_putc(&o,'/'); buf_write(&o,s->slug.p,s->slug.len); s->outDir=(Str){o.p,o.len}; }
+    Buf u;u.p=NULL;u.len=0;u.cap=0; buf_write(&u,b->base.p,b->base.len); buf_putc(&u,'/'); buf_write(&u,s->outDir.p,s->outDir.len); buf_putc(&u,'/'); s->url=(Str){u.p,u.len};
+  }
+}
+
+// 4. markdown
+static void markdown(Build* b){
+  for (u32 i=0;i<b->nsources;i++){
+    Source* s=&b->sources[i];
+    BuildCtx* c=&b->bc;
+    c->curDir = dir_of(s->path);
+    g_cur_source_path = s->path;
+    Env env; env.link=build_link; env.ctx=c;
+    Buf html; html.p=NULL;html.len=0;html.cap=0;
+    TocArr toc; toc.v=NULL;toc.len=0;toc.cap=0;
+    Str excerpt; excerpt.p=NULL;excerpt.len=0;
+    render_markdown(s->body.p, s->body.len, &env, &html, &toc, &excerpt);
+    s->html=(Str){html.p,html.len}; s->toc=toc; s->excerpt=excerpt;
+  }
+}
+
+// 5. collections
+static void collections(Build* b){
+  b->posts=(Source**)bump(b->nsources*sizeof(Source*)); b->nposts=0;
+  for (u32 i=0;i<b->nsources;i++) if (b->sources[i].post) b->posts[b->nposts++]=&b->sources[i];
+  sort_posts(b->posts,b->nposts);
+  for (u32 k=0;k<b->nposts;k++){ b->posts[k]->newer = k==0?NULL:b->posts[k-1]; b->posts[k]->older = k==b->nposts-1?NULL:b->posts[k+1]; }
+}
+
+static u32 g_cur_dummy2;
+
+// 6. tags
+static Tag* build_find_or_add_tag(Build* b, Str name, Str slug){
+  for (u32 i=0;i<b->ntags;i++) if (str_eq(b->tags[i]->slug,slug)) return b->tags[i];
+  if (b->ntags==b->captags){ u32 nc=b->captags?b->captags*2:8; Tag** nt=(Tag**)bump(nc*sizeof(Tag*)); if(b->tags&&b->ntags)memcpy(nt,b->tags,b->ntags*sizeof(Tag*)); b->tags=nt; b->captags=nc; }
+  Tag* t=(Tag*)bump(sizeof(Tag)); memset(t,0,sizeof(Tag));
+  t->name=name; t->slug=slug;
+  Buf u;u.p=NULL;u.len=0;u.cap=0; buf_write(&u,b->base.p,b->base.len); buf_puts(&u,"/tags/"); buf_write(&u,slug.p,slug.len); buf_putc(&u,'/'); t->url=(Str){u.p,u.len};
+  b->tags[b->ntags++]=t; return t;
+}
+
+// ownTags(s): the source's tags, each slug once, in its own order. Returns array of (name) Strs.
+// We need both name and slug. Return StrVec of names (filtered).
+static void own_tags(Source* s, StrVec* outNames, StrVec* outSlugs){
+  outNames->len=0; outSlugs->len=0;
+  if (!s->data.has_tags) return;
+  for (u32 i=0;i<s->data.ntags;i++){
+    Str name=s->data.tags[i];
+    Buf t;t.p=NULL;t.len=0;t.cap=0; slugify_into(&t,name.p,name.len); Str slug={t.p,t.len};
+    // seen slug?
+    if (strvec_has(outSlugs,slug)) continue;
+    strvec_push(outNames,name); strvec_push(outSlugs,slug);
+  }
+}
+
+static void tags_stage(Build* b){
+  StrVec names, slugs; names.v=NULL;names.len=0;names.cap=0; slugs.v=NULL;slugs.len=0;slugs.cap=0;
+  // posts
+  for (u32 i=0;i<b->nposts;i++){
+    Source* p=b->posts[i];
+    // tagRefs for post
+    p->ntagRefs=0; p->tagRefs=NULL;
+    own_tags(p,&names,&slugs);
+    u32 nt=slugs.len;
+    Tag** refs=(Tag**)bump((nt?nt:1)*sizeof(Tag*));
+    u32 rn=0;
+    for (u32 k=0;k<nt;k++){
+      Str slug=slugs.v[k]; Str name=names.v[k];
+      Tag* t=build_find_or_add_tag(b,name,slug);
+      tag_add_post(t,p);
+      refs[rn++]=t;
+    }
+    p->tagRefs=refs; p->ntagRefs=rn;
+  }
+  // pages
+  for (u32 i=0;i<b->nsources;i++){
+    Source* s=&b->sources[i];
+    if (s->post) continue;
+    own_tags(s,&names,&slugs);
+    u32 nt=slugs.len;
+    s->tagRefs=(Tag**)bump((nt?nt:1)*sizeof(Tag*)); s->ntagRefs=0;
+    for (u32 k=0;k<nt;k++){
+      Str slug=slugs.v[k]; Str name=names.v[k];
+      Tag* existing=NULL;
+      for(u32 z=0;z<b->ntags;z++) if(str_eq(b->tags[z]->slug,slug)){existing=b->tags[z];break;}
+      if (existing) s->tagRefs[s->ntagRefs++]=existing;
+      else {
+        // synthetic tag with url ""
+        Tag* t=(Tag*)bump(sizeof(Tag)); memset(t,0,sizeof(Tag)); t->name=name;t->slug=slug; Str e=str_from_c(""); t->url=e;
+        s->tagRefs[s->ntagRefs++]=t;
+      }
+    }
+  }
+  // sort tags: build pointer array (b->tags already 0..ntags-1)
+  sort_tags(b->tags, b->ntags);
+}
+
+static u32 g_cur_dummy3;
+
+// ---- card/link builders (Val) ----
+static Val* link_of(Source* s){
+  if (!s) return vnull();
+  Val* o=vobj_new(4);
+  vobj_set_checked(o,str_from_c("title"), vstr(s->data.title));
+  vobj_set_checked(o,str_from_c("url"), vstr(s->url));
+  vobj_set_checked(o,str_from_c("date"), s->data.has_date? vstr(s->data.date) : vstr(str_from_c("")));
+  if (s->data.has_date){ Buf d;d.p=NULL;d.len=0;d.cap=0; long_date_into(&d,s->data.date.p); vobj_set_checked(o,str_from_c("date_long"), vstr((Str){d.p,d.len})); }
+  else vobj_set_checked(o,str_from_c("date_long"), vstr(str_from_c("")));
+  return o;
+}
+
+static Val* card_of(Source* s){
+  Val* o=vobj_new(8);
+  vobj_set_checked(o,str_from_c("title"), vstr(s->data.title));
+  vobj_set_checked(o,str_from_c("url"), vstr(s->url));
+  vobj_set_checked(o,str_from_c("date"), s->data.has_date? vstr(s->data.date) : vstr(str_from_c("")));
+  if (s->data.has_date){ Buf d;d.p=NULL;d.len=0;d.cap=0; long_date_into(&d,s->data.date.p); vobj_set_checked(o,str_from_c("date_long"), vstr((Str){d.p,d.len})); }
+  else vobj_set_checked(o,str_from_c("date_long"), vstr(str_from_c("")));
+  vobj_set_checked(o,str_from_c("summary"), s->data.has_summary? vstr(s->data.summary) : vstr(str_from_c("")));
+  vobj_set_checked(o,str_from_c("excerpt"), vstr(s->excerpt));
+  // reading_minutes = max(1, ceil(words/200)). words of BODY.
+  u32 words = words_of(s->body);
+  u32 mins = (words+199)/200; if (mins<1) mins=1;
+  vobj_set_checked(o,str_from_c("reading_minutes"), vnum(mins));
+  // tags array
+  Val* tags=varr_new(4);
+  for (u32 k=0;k<s->ntagRefs;k++){ Tag* t=s->tagRefs[k]; Val* to=vobj_new(3); vobj_set_checked(to,str_from_c("name"),vstr(t->name)); vobj_set_checked(to,str_from_c("slug"),vstr(t->slug)); vobj_set_checked(to,str_from_c("url"),vstr(t->url)); varr_push(tags,to); }
+  vobj_set_checked(o,str_from_c("tags"), tags);
+  return o;
+}
+
+static Val* page_of(Build* b, Source* s){
+  // {...card, slug, content, toc, newer, older, is_post}
+  Val* o=vobj_new(10);
+  // spread card fields
+  Val* card=s->card;
+  for (u32 i=0;i<card->as.obj.len;i++) vobj_set_checked(o, card->as.obj.m[i].key, card->as.obj.m[i].val);
+  vobj_set_checked(o,str_from_c("slug"), vstr(s->slug));
+  vobj_set_checked(o,str_from_c("content"), vstr(s->html));
+  Val* toc=varr_new(4);
+  for (u32 k=0;k<s->toc.len;k++){ Val* h=vobj_new(3); vobj_set_checked(h,str_from_c("level"),vnum(s->toc.v[k].level)); vobj_set_checked(h,str_from_c("id"),vstr(s->toc.v[k].id)); vobj_set_checked(h,str_from_c("html"),vstr(s->toc.v[k].html)); varr_push(toc,h); }
+  vobj_set_checked(o,str_from_c("toc"), toc);
+  vobj_set_checked(o,str_from_c("newer"), link_of(s->newer));
+  vobj_set_checked(o,str_from_c("older"), link_of(s->older));
+  vobj_set_checked(o,str_from_c("is_post"), vbool(s->post));
+  (void)b;
+  return o;
+}
+
+// render helper: render template `name` with root vars object. Returns Buf (may be empty if missing).
+static void render_template(Build* b, Str name, Val* rootvars, Buf* out){
+  NodeArr* nodes=tpl_get(&b->tpls, name);
+  if (!nodes) return;
+  Scope sc; sc.vars=rootvars; sc.parent=NULL;
+  RenderCtx ctx; ctx.tpls=&b->tpls;
+  render_nodes(nodes, &sc, &ctx, 0, out);
+}
+
+// output map: ordered list of (path, content) — we use a dynamic array preserving insertion order.
+typedef struct { Str path; Str content; } OutEnt;
+typedef struct { OutEnt* v; u32 len; u32 cap; } OutMap;
+static void out_set(OutMap* m, Str path, Str content){
+  for (u32 i=0;i<m->len;i++) if (str_eq(m->v[i].path,path)){ m->v[i].content=content; return; }
+  if (m->len==m->cap){ u32 nc=m->cap?m->cap*2:32; OutEnt* nm=(OutEnt*)bump(nc*sizeof(OutEnt)); if(m->v&&m->len)memcpy(nm,m->v,m->len*sizeof(OutEnt)); m->v=nm; m->cap=nc; }
+  m->v[m->len].path=path; m->v[m->len].content=content; m->len++;
+}
+static int out_has(OutMap* m, Str path){ for(u32 i=0;i<m->len;i++) if(str_eq(m->v[i].path,path)) return 1; return 0; }
+
+static u32 g_cur_dummy4;
+
+// 7. layouts
+// forward decls for globals defined below (OutEnt/OutMap already defined above)
+extern Str g_site_title;
+extern u32 g_site_recent;
+extern u32 g_site_per_page;
+extern OutMap g_out_map;
+
+static void layouts(Build* b){
+  // build cards once
+  for (u32 i=0;i<b->nsources;i++) b->sources[i].card=card_of(&b->sources[i]);
+  // site, tags(all), recent
+  Val* site=vobj_new(2);
+  // site.title from input
+  // (we stash input site title/base in Build via globals set in mg_run)
+  extern Str g_site_title;
+  vobj_set_checked(site,str_from_c("title"), vstr(g_site_title));
+  vobj_set_checked(site,str_from_c("base_url"), vstr(b->base));
+  Val* allTags=varr_new(4);
+  for (u32 i=0;i<b->ntags;i++){ Tag* t=b->tags[i]; Val* to=vobj_new(4); vobj_set_checked(to,str_from_c("name"),vstr(t->name)); vobj_set_checked(to,str_from_c("slug"),vstr(t->slug)); vobj_set_checked(to,str_from_c("url"),vstr(t->url)); vobj_set_checked(to,str_from_c("count"),vnum(t->nposts)); varr_push(allTags,to); }
+  u32 recent_n = g_site_recent; Val* recent=varr_new(4);
+  for (u32 i=0;i<b->nposts && i<recent_n;i++) varr_push(recent, b->posts[i]->card);
+
+  OutMap out; out.v=NULL;out.len=0;out.cap=0;
+
+  // each source page
+  for (u32 i=0;i<b->nsources;i++){
+    Source* s=&b->sources[i];
+    Val* root=vobj_new(4);
+    vobj_set_checked(root,str_from_c("site"),site);
+    vobj_set_checked(root,str_from_c("tags"),allTags);
+    vobj_set_checked(root,str_from_c("recent"),recent);
+    Val* pv=vobj_new(1); vobj_set_checked(pv,str_from_c("page"), page_of(b,s));
+    // merge pv into root
+    for(u32 z=0;z<pv->as.obj.len;z++) vobj_set_checked(root,pv->as.obj.m[z].key,pv->as.obj.m[z].val);
+    Buf html; html.p=NULL;html.len=0;html.cap=0;
+    render_template(b, s->layout, root, &html);
+    // path = outDir + "/index.html"
+    Buf pth; pth.p=NULL;pth.len=0;pth.cap=0; buf_write(&pth,s->outDir.p,s->outDir.len); buf_puts(&pth,"/index.html");
+    out_set(&out,(Str){pth.p,pth.len},(Str){html.p,html.len});
+  }
+  // index pages
+  u32 per = g_site_per_page;
+  u32 pages = (b->nposts + per - 1)/per; if (pages<1) pages=1;
+  for (u32 k=1;k<=pages;k++){
+    Val* root=vobj_new(4);
+    vobj_set_checked(root,str_from_c("site"),site);
+    vobj_set_checked(root,str_from_c("tags"),allTags);
+    vobj_set_checked(root,str_from_c("recent"),recent);
+    Val* posts=varr_new(4);
+    for (u32 j=(k-1)*per; j<k*per && j<b->nposts; j++) varr_push(posts, b->posts[j]->card);
+    vobj_set_checked(root,str_from_c("posts"),posts);
+    // pager (indexUrl(k): k==1 -> base/ , else base/page/k/)
+    Val* pager=vobj_new(5);
+    vobj_set_checked(pager,str_from_c("number"),vnum(k));
+    vobj_set_checked(pager,str_from_c("total"),vnum(pages));
+    { Buf u;u.p=NULL;u.len=0;u.cap=0; buf_write(&u,b->base.p,b->base.len); if(k==1){buf_putc(&u,'/');} else {buf_puts(&u,"/page/");buf_put_u32(&u,k);buf_putc(&u,'/');} vobj_set_checked(pager,str_from_c("url"),vstr((Str){u.p,u.len})); }
+    { Buf u;u.p=NULL;u.len=0;u.cap=0; if(k==1){/* "" */} else {buf_write(&u,b->base.p,b->base.len); if(k-1==1){buf_putc(&u,'/');} else {buf_puts(&u,"/page/");buf_put_u32(&u,k-1);buf_putc(&u,'/');}} vobj_set_checked(pager,str_from_c("newer_url"),vstr((Str){u.p,u.len})); }
+    { Buf u;u.p=NULL;u.len=0;u.cap=0; if(k==pages){/* "" */} else {buf_write(&u,b->base.p,b->base.len); buf_puts(&u,"/page/");buf_put_u32(&u,k+1);buf_putc(&u,'/');} vobj_set_checked(pager,str_from_c("older_url"),vstr((Str){u.p,u.len})); }
+    vobj_set_checked(root,str_from_c("pager"),pager);
+    Buf html; html.p=NULL;html.len=0;html.cap=0;
+    render_template(b, str_from_c("index"), root, &html);
+    // only set if template existed (render_template leaves html empty if missing). Check tpl_get.
+    if (tpl_get(&b->tpls, str_from_c("index"))){
+      Buf pth; pth.p=NULL;pth.len=0;pth.cap=0; if(k==1) buf_puts(&pth,"index.html"); else {buf_puts(&pth,"page/");buf_put_u32(&pth,k);buf_puts(&pth,"/index.html");}
+      out_set(&out,(Str){pth.p,pth.len},(Str){html.p,html.len});
+    }
+  }
+  // tag pages
+  for (u32 i=0;i<b->ntags;i++){
+    Tag* t=b->tags[i];
+    Val* root=vobj_new(4);
+    vobj_set_checked(root,str_from_c("site"),site);
+    vobj_set_checked(root,str_from_c("tags"),allTags);
+    vobj_set_checked(root,str_from_c("recent"),recent);
+    // tag object: {name,slug,url,count,posts:[cards]}
+    Val* tv=vobj_new(5);
+    vobj_set_checked(tv,str_from_c("name"),vstr(t->name));
+    vobj_set_checked(tv,str_from_c("slug"),vstr(t->slug));
+    vobj_set_checked(tv,str_from_c("url"),vstr(t->url));
+    vobj_set_checked(tv,str_from_c("count"),vnum(t->nposts));
+    Val* tposts=varr_new(4); for(u32 z=0;z<t->nposts;z++) varr_push(tposts, t->posts[z]->card);
+    vobj_set_checked(tv,str_from_c("posts"),tposts);
+    vobj_set_checked(root,str_from_c("tag"),tv);
+    Buf html; html.p=NULL;html.len=0;html.cap=0;
+    render_template(b, str_from_c("tag"), root, &html);
+    if (tpl_get(&b->tpls, str_from_c("tag"))){
+      Buf pth;pth.p=NULL;pth.len=0;pth.cap=0; buf_puts(&pth,"tags/");buf_write(&pth,t->slug.p,t->slug.len);buf_puts(&pth,"/index.html");
+      out_set(&out,(Str){pth.p,pth.len},(Str){html.p,html.len});
+    }
+  }
+  // tags index
+  if (tpl_get(&b->tpls, str_from_c("tags"))){
+    Val* root=vobj_new(4);
+    vobj_set_checked(root,str_from_c("site"),site);
+    vobj_set_checked(root,str_from_c("tags"),allTags);
+    vobj_set_checked(root,str_from_c("recent"),recent);
+    Buf html; html.p=NULL;html.len=0;html.cap=0;
+    render_template(b, str_from_c("tags"), root, &html);
+    out_set(&out,str_from_c("tags/index.html"),(Str){html.p,html.len});
+  }
+  // statics
+  for (u32 i=0;i<b->nstatics;i++){
+    Str path=b->staticsPath[i];
+    if (out_has(&out,path)){
+      Buf bl;bl.p=NULL;bl.len=0;bl.cap=0; buf_puts(&bl,"shadowed "); buf_write(&bl,path.p,path.len); buf_puts(&bl,": a built page has its path");
+      strvec_push(&b->report,(Str){bl.p,bl.len});
+    } else out_set(&out,path,b->staticsContent[i]);
+  }
+  // 8. report
+  {
+    StrVec lines; lines.v=NULL;lines.len=0;lines.cap=0;
+    for (u32 i=0;i<b->report.len;i++) strvec_push(&lines,b->report.v[i]);
+    for (u32 i=0;i<b->bc.broken.len;i++) strvec_push(&lines,b->bc.broken.v[i]);
+    sort_strvec(&lines);
+    u32 pages=0; for(u32 i=0;i<b->nsources;i++) if(!b->sources[i].post) pages++;
+    Buf rb; rb.p=NULL;rb.len=0;rb.cap=0;
+    for (u32 i=0;i<lines.len;i++){ buf_write(&rb,lines.v[i].p,lines.v[i].len); buf_putc(&rb,'\n'); }
+    buf_puts(&rb,"built "); buf_put_u32(&rb,pages); buf_puts(&rb," pages, "); buf_put_u32(&rb,b->nposts); buf_puts(&rb," posts, "); buf_put_u32(&rb,b->ntags); buf_puts(&rb," tags and "); buf_put_u32(&rb,b->nstatics); buf_puts(&rb," static files\n");
+    out_set(&out,str_from_c(REPORT_FILE),(Str){rb.p,rb.len});
+  }
+  // stash out for serialization
+  g_out_map = out;
+}
+
+Str g_site_title;
+u32 g_site_recent;
+u32 g_site_per_page;
+OutMap g_out_map;
+
+static u32 g_cur_dummy5;
+
+// ================================================================== per-case build driver
+// input is a JVal object {site, templates, files}. Builds into globals, serializes to *out as a
+// JSON object (path -> text). Caller resets arena between cases via mg_run.
+static void run_one_case(JVal* input, Buf* out){
+  // reset build globals
+  Build b; memset(&b,0,sizeof(b));
+  b.bc.sources=NULL;b.bc.nsources=0;b.bc.broken.v=NULL;b.bc.broken.len=0;b.bc.broken.cap=0;
+  g_out_map.v=NULL;g_out_map.len=0;g_out_map.cap=0;
+  g_cur_source_path=str_from_c("");
+  // site
+  JVal* jsite=jobj_get(input,"site");
+  Str base_url=str_from_c(""); g_site_title=str_from_c("");
+  u32 per=6, recent=3;
+  if (jsite){
+    JVal* bt=jobj_get(jsite,"base_url"); if(bt&&bt->tag==JSTR) base_url=(Str){bt->as.s.p,bt->as.s.len};
+    JVal* ti=jobj_get(jsite,"title"); if(ti&&ti->tag==JSTR) g_site_title=(Str){ti->as.s.p,ti->as.s.len};
+    JVal* pp=jobj_get(jsite,"per_page"); if(pp&&pp->tag==JNUM) per=(u32)pp->as.num;
+    JVal* rc=jobj_get(jsite,"recent"); if(rc&&rc->tag==JNUM) recent=(u32)rc->as.num;
+  }
+  g_site_per_page=per; g_site_recent=recent;
+  // base = base_url with trailing / removed
+  while (base_url.len>0 && base_url.p[base_url.len-1]=='/') base_url.len--;
+  b.base=base_url;
+  // templates: parse each (sorted by name), skip TemplateErrors with report line
+  JVal* jtpls=jobj_get(input,"templates");
+  // collect names sorted
+  if (jtpls && jtpls->tag==JOBJ){
+    u32 tn=jtpls->as.obj.len;
+    u32* idx=(u32*)bump(tn*sizeof(u32)); for(u32 i=0;i<tn;i++) idx[i]=i;
+    for(u32 i=1;i<tn;i++){ u32 k=idx[i]; u32 j=i; Str kp={jtpls->as.obj.m[k].key,jtpls->as.obj.m[k].keylen};
+      while(j>0){ Str jp={jtpls->as.obj.m[idx[j-1]].key,jtpls->as.obj.m[idx[j-1]].keylen}; if(str_cmp(jp,kp)>0){idx[j]=idx[j-1];j--;} else break; } idx[j]=k; }
+    b.tpls.v=(TplEnt*)bump(tn*sizeof(TplEnt)); b.tpls.len=0;
+    for (u32 ii=0;ii<tn;ii++){
+      u32 k=idx[ii]; Str nm={jtpls->as.obj.m[k].key,jtpls->as.obj.m[k].keylen};
+      JVal* sv=jtpls->as.obj.m[k].val;
+      NodeArr nodes; Str e; e.p=NULL;e.len=0;
+      int rc = (sv->tag==JSTR)? parse_template(nm, sv->as.s.p, sv->as.s.len, &nodes, &e) : 1;
+      if (rc){
+        Buf bl;bl.p=NULL;bl.len=0;bl.cap=0; buf_write(&bl,e.p,e.len);
+        strvec_push(&b.report,(Str){bl.p,bl.len});
+        continue;
+      }
+      b.tpls.v[b.tpls.len].name=nm; b.tpls.v[b.tpls.len].nodes=(NodeArr*)bump(sizeof(NodeArr)); *b.tpls.v[b.tpls.len].nodes=nodes; b.tpls.len++;
+    }
+  }
+  // files
+  JVal* jfiles=jobj_get(input,"files");
+  b.bc.sources=NULL; b.bc.nsources=0;
+  if (jfiles && jfiles->tag==JARR) read_sources(&b, jfiles);
+  // wire buildctx sources pointer/count after read (sources array may have been reallocated)
+  b.bc.sources=b.sources; b.bc.nsources=b.nsources;
+  b.bc.base=b.base;
+  // static paths for buildctx
+  b.bc.staticPaths=b.staticsPath; b.bc.nstatics=b.nstatics;
+  front_matter(&b);
+  b.bc.sources=b.sources; b.bc.nsources=b.nsources; // may have shrunk
+  permalinks(&b);
+  markdown(&b);
+  collections(&b);
+  tags_stage(&b);
+  layouts(&b);
+  // serialize g_out_map as JSON object
+  buf_putc(out,'{');
+  for (u32 i=0;i<g_out_map.len;i++){ if(i)buf_putc(out,','); json_write_string(out, g_out_map.v[i].path.p, g_out_map.v[i].path.len); buf_putc(out,':'); json_write_string(out, g_out_map.v[i].content.p, g_out_map.v[i].content.len); }
+  buf_putc(out,'}');
+}
+
+// ================================================================== mg_run: the real entry
+// inPtr/inLen = raw bytes of /input/cases.json (array of {id, input}).
+// Builds answers.json bytes in-C, writes {out_ptr,out_len} to CTRL.
+__attribute__((export_name("mg_run")))
+u32 mg_run(u32 inPtr, u32 inLen){
+  arena_init(inPtr + inLen);
+  JParse ps; ps.p=(const u8*)inPtr; ps.end=(const u8*)inPtr+inLen; ps.err=0;
+  JVal* cases=jparse_value(&ps);
+  Buf out; out.p=NULL;out.len=0;out.cap=0;
+  if (ps.err || cases->tag!=JARR){ CTRL[CTRL_OUT_PTR]=(u32)out.p;CTRL[CTRL_OUT_LEN]=0;CTRL[CTRL_STATUS]=2; return 0; }
+  buf_putc(&out,'[');
+  for (u32 i=0;i<cases->as.arr.len;i++){
+    if (i) buf_putc(&out,',');
+    JVal* c=cases->as.arr.items[i];
+    JVal* input=jobj_get(c,"input");
+    if (input) run_one_case(input,&out); else buf_puts(&out,"null");
+  }
+  buf_putc(&out,']');
+  CTRL[CTRL_OUT_PTR]=(u32)out.p; CTRL[CTRL_OUT_LEN]=out.len; CTRL[CTRL_STATUS]=0;
+  return out.len;
+}
+
+// DEBUG: run pipeline for case[dbgcase], dump each source's path + html length + first null pos.
+__attribute__((export_name("mg_debug")))
+u32 mg_debug(u32 inPtr, u32 inLen, u32 dbgcase){
+  arena_init(inPtr+inLen);
+  JParse ps; ps.p=(const u8*)inPtr; ps.end=(const u8*)inPtr+inLen; ps.err=0;
+  JVal* cases=jparse_value(&ps);
+  JVal* c=cases->as.arr.items[dbgcase]; JVal* input=jobj_get(c,"input");
+  Build b; memset(&b,0,sizeof(b));
+  b.bc.broken.v=NULL;b.bc.broken.len=0;b.bc.broken.cap=0; g_out_map.v=NULL;g_out_map.len=0;g_out_map.cap=0; g_cur_source_path=str_from_c("");
+  JVal* jsite=jobj_get(input,"site"); Str base_url=str_from_c(""); g_site_title=str_from_c(""); u32 per=6,recent=3;
+  if(jsite){ JVal* bt=jobj_get(jsite,"base_url"); if(bt&&bt->tag==JSTR)base_url=(Str){bt->as.s.p,bt->as.s.len}; JVal* ti=jobj_get(jsite,"title"); if(ti&&ti->tag==JSTR)g_site_title=(Str){ti->as.s.p,ti->as.s.len}; JVal* pp=jobj_get(jsite,"per_page"); if(pp&&pp->tag==JNUM)per=(u32)pp->as.num; JVal* rc=jobj_get(jsite,"recent"); if(rc&&rc->tag==JNUM)recent=(u32)rc->as.num; }
+  g_site_per_page=per;g_site_recent=recent; while(base_url.len>0&&base_url.p[base_url.len-1]=='/')base_url.len--; b.base=base_url;
+  JVal* jtpls=jobj_get(input,"templates");
+  if(jtpls&&jtpls->tag==JOBJ){ u32 tn=jtpls->as.obj.len; b.tpls.v=(TplEnt*)bump(tn*sizeof(TplEnt)); b.tpls.len=0;
+    for(u32 k=0;k<tn;k++){ Str nm={jtpls->as.obj.m[k].key,jtpls->as.obj.m[k].keylen}; JVal* sv=jtpls->as.obj.m[k].val; NodeArr nodes; Str e; int rc=(sv->tag==JSTR)?parse_template(nm,sv->as.s.p,sv->as.s.len,&nodes,&e):1; if(rc)continue; b.tpls.v[b.tpls.len].name=nm; b.tpls.v[b.tpls.len].nodes=(NodeArr*)bump(sizeof(NodeArr)); *b.tpls.v[b.tpls.len].nodes=nodes; b.tpls.len++; } }
+  JVal* jfiles=jobj_get(input,"files"); if(jfiles&&jfiles->tag==JARR) read_sources(&b,jfiles);
+  b.bc.sources=b.sources;b.bc.nsources=b.nsources;b.bc.base=b.base;b.bc.staticPaths=b.staticsPath;b.bc.nstatics=b.nstatics;
+  front_matter(&b); b.bc.sources=b.sources;b.bc.nsources=b.nsources; permalinks(&b); markdown(&b);
+  Buf out; out.p=NULL;out.len=0;out.cap=0;
+  for(u32 i=0;i<b.nsources;i++){ Source* s=&b.sources[i]; if(!path_starts(s->path,str_from_c("posts/2020/slug-this-were"))) continue;
+    buf_puts(&out,"PATH "); buf_write(&out,s->path.p,s->path.len); buf_puts(&out," bodylen "); buf_put_u32(&out,s->body.len); buf_puts(&out," htmllen "); buf_put_u32(&out,s->html.len);
+    // first null in html
+    i64 fn=-1; for(u32 k=0;k<s->html.len;k++) if(s->html.p[k]==0){fn=(i64)k;break;} buf_puts(&out," firstnull "); buf_put_i64(&out,fn); buf_putc(&out,'\n');
+    buf_puts(&out,"HTML:"); buf_write(&out,s->html.p,s->html.len); buf_putc(&out,'\n');
+    // also render body fresh with identity env
+    Env idenv; idenv.link=identity_link; idenv.ctx=NULL; Buf ih; ih.p=NULL;ih.len=0;ih.cap=0; TocArr it; it.v=NULL;it.len=0;it.cap=0; Str ie; ie.p=NULL;ie.len=0;
+    render_markdown(s->body.p,s->body.len,&idenv,&ih,&it,&ie);
+    i64 fn2=-1; for(u32 k=0;k<ih.len;k++) if(ih.p[k]==0){fn2=(i64)k;break;}
+    buf_puts(&out,"IDENTITY htmllen "); buf_put_u32(&out,ih.len); buf_puts(&out," firstnull "); buf_put_i64(&out,fn2); buf_putc(&out,'\n');
+    // dump body null check + body bytes
+    i64 bfn=-1; for(u32 k=0;k<s->body.len;k++) if(s->body.p[k]==0){bfn=(i64)k;break;}
+    buf_puts(&out,"BODY firstnull "); buf_put_i64(&out,bfn); buf_puts(&out," bodylen "); buf_put_u32(&out,s->body.len); buf_putc(&out,'\n');
+    buf_puts(&out,"BODYHEX:"); { const char* hx="0123456789abcdef"; for(u32 k=0;k<s->body.len;k++){ u8 c=s->body.p[k]; buf_putc(&out,(u8)hx[c>>4]); buf_putc(&out,(u8)hx[c&15]); } } buf_putc(&out,'\n');
+    buf_puts(&out,"PTRS body="); buf_put_u32(&out,(u32)s->body.p); buf_puts(&out," text="); buf_put_u32(&out,(u32)s->text.p); buf_puts(&out," arena="); buf_put_u32(&out,g_arena); buf_puts(&out," memsize="); buf_put_u32(&out,g_memsize); buf_putc(&out,'\n');
+    // render AGAIN after resetting arena to a fresh high region
+    u32 save=g_arena; g_arena=700*1024*1024; Buf ih2; ih2.p=NULL;ih2.len=0;ih2.cap=0; TocArr it2; it2.v=NULL;it2.len=0;it2.cap=0; Str ie2; ie2.p=NULL;ie2.len=0;
+    render_markdown(s->body.p,s->body.len,&idenv,&ih2,&it2,&ie2);
+    i64 fn3=-1; for(u32 k=0;k<ih2.len;k++) if(ih2.p[k]==0){fn3=(i64)k;break;}
+    buf_puts(&out,"FRESHARENA htmllen "); buf_put_u32(&out,ih2.len); buf_puts(&out," firstnull "); buf_put_i64(&out,fn3); buf_putc(&out,'\n'); g_arena=save;
+  }
+  CTRL[CTRL_OUT_PTR]=(u32)out.p;CTRL[CTRL_OUT_LEN]=out.len;CTRL[CTRL_STATUS]=0; return out.len;
+}
