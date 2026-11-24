@@ -1392,7 +1392,7 @@ static void render_into(NodeArr* nodes, Scope* scope, RenderCtx* ctx, int depth,
         Val* xs=lookup(scope,n->path,n->plen);
         if (!xs || xs->tag!=VARR) break;
         u32 len=xs->as.arr.len;
-        // build loop object + per-iteration scope
+        // reuse one loop object + one vars object across iterations (like JS), mutate fields instead of new each time
         Val* loop=vobj_new(4);
         Val* vars=vobj_new(4);
         vobj_set(vars, n->name, vnull());
